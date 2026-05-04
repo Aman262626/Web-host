@@ -205,7 +205,7 @@ def api_upload():
     if not site_name:
         return jsonify({"error": "site_name is required"}), 400
 
-    if not file.filename.endswith(".zip"):
+    if not file.filename or not file.filename.endswith(".zip"):
         return jsonify({"error": "Only ZIP files allowed"}), 400
 
     site_name = secure_filename(site_name)

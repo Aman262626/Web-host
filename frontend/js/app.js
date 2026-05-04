@@ -182,16 +182,23 @@ function renderSiteCards(sites) {
                 <a href="${escapeHtml(site.url)}" target="_blank" class="btn btn-primary btn-sm">
                     <i class="fas fa-external-link-alt"></i> Visit
                 </a>
-                <button class="btn btn-outline btn-sm" onclick="copyUrl('${escapeHtml(site.url)}')">
+                <button class="btn btn-outline btn-sm copy-btn" data-url="${escapeHtml(site.url)}">
                     <i class="fas fa-copy"></i> Copy URL
                 </button>
-                <button class="btn btn-danger btn-sm" onclick="showDeleteModal('${escapeHtml(site.name)}')">
+                <button class="btn btn-danger btn-sm delete-btn" data-name="${escapeHtml(site.name)}">
                     <i class="fas fa-trash"></i>
                 </button>
             </div>
         </div>`
         )
         .join("");
+
+    grid.querySelectorAll(".copy-btn").forEach((btn) => {
+        btn.addEventListener("click", () => copyUrl(btn.dataset.url));
+    });
+    grid.querySelectorAll(".delete-btn").forEach((btn) => {
+        btn.addEventListener("click", () => showDeleteModal(btn.dataset.name));
+    });
 }
 
 // Search sites
@@ -430,7 +437,7 @@ function formatBytes(bytes) {
 function escapeHtml(str) {
     const div = document.createElement("div");
     div.textContent = str;
-    return div.innerHTML.replace(/'/g, "&#39;");
+    return div.innerHTML.replace(/'/g, "&#39;").replace(/"/g, "&quot;");
 }
 
 // ===== INIT =====
