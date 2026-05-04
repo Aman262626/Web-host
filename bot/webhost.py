@@ -75,6 +75,7 @@ def update_data(modify_fn):
 
 # --------------- FLASK APP ---------------
 app_web = Flask(__name__)
+app_web.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app_web)
 user_state = {}
 
