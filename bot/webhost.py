@@ -184,9 +184,10 @@ def api_delete_site(site_name):
     if os.path.exists(folder):
         shutil.rmtree(folder)
 
-    del sites[site_name]
-    data.get("analytics", {}).pop(site_name, None)
-    save_data(data)
+    def _delete(d):
+        d.get("sites", {}).pop(site_name, None)
+        d.get("analytics", {}).pop(site_name, None)
+    update_data(_delete)
 
     return jsonify({"message": f"Site '{site_name}' deleted"})
 
@@ -218,8 +219,7 @@ def api_upload():
     file.save(zip_path)
 
     try:
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(base_folder)
+        _safe_extract(zip_path, base_folder)
     except Exception as e:
         shutil.rmtree(base_folder, ignore_errors=True)
         return jsonify({"error": f"ZIP extraction failed: {e}"}), 400
@@ -227,12 +227,12 @@ def api_upload():
     os.remove(zip_path)
     _flatten_nested_folder(base_folder)
 
-    data = load_data()
-    data.setdefault("sites", {})[site_name] = {
-        "owner": "web-upload",
-        "created": datetime.now().isoformat(),
-    }
-    save_data(data)
+    def _register(data):
+        data.setdefault("sites", {})[site_name] = {
+            "owner": "web-upload",
+            "created": datetime.now().isoformat(),
+        }
+    update_data(_register)
 
     link = f"{DOMAIN}/{site_name}/"
     return jsonify({"message": "Site deployed!", "url": link, "name": site_name})
@@ -256,6 +256,17 @@ def api_stats():
 
 
 # --------------- HELPERS ---------------
+def _safe_extract(zip_path, target_dir):
+    """Extract ZIP safely, rejecting entries with path traversal."""
+    real_target = os.path.realpath(target_dir)
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        for member in zip_ref.namelist():
+            member_path = os.path.realpath(os.path.join(target_dir, member))
+            if not member_path.startswith(real_target + os.sep) and member_path != real_target:
+                raise ValueError(f"Illegal path in ZIP: {member}")
+        zip_ref.extractall(target_dir)
+
+
 def _flatten_nested_folder(base_folder):
     """Flatten single nested directory inside extracted ZIP."""
     while True:
@@ -377,9 +388,10 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(folder):
         shutil.rmtree(folder)
 
-    del sites[site_name]
-    data.get("analytics", {}).pop(site_name, None)
-    save_data(data)
+    def _del(d):
+        d.get("sites", {}).pop(site_name, None)
+        d.get("analytics", {}).pop(site_name, None)
+    update_data(_del)
 
     await update.message.reply_text(f"Site '{site_name}' has been deleted.")
 
@@ -418,11 +430,14 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(old_folder):
         shutil.move(old_folder, new_folder)
 
-    sites[new_name] = sites.pop(old_name)
-    analytics = data.get("analytics", {})
-    if old_name in analytics:
-        analytics[new_name] = analytics.pop(old_name)
-    save_data(data)
+    def _rename(d):
+        s = d.get("sites", {})
+        if old_name in s:
+            s[new_name] = s.pop(old_name)
+        a = d.get("analytics", {})
+        if old_name in a:
+            a[new_name] = a.pop(old_name)
+    update_data(_rename)
 
     link = f"{DOMAIN}/{new_name}/"
     await update.message.reply_text(
@@ -580,9 +595,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             folder = os.path.join(WEBSITES_DIR, site_name)
             if os.path.exists(folder):
                 shutil.rmtree(folder)
-            del sites[site_name]
-            data.get("analytics", {}).pop(site_name, None)
-            save_data(data)
+            def _del_cb(d):
+                d.get("sites", {}).pop(site_name, None)
+                d.get("analytics", {}).pop(site_name, None)
+            update_data(_del_cb)
             await query.message.reply_text(f"Site '{site_name}' deleted.")
         else:
             await query.message.reply_text("Site not found.")
@@ -594,15 +610,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
     # Track user
-    data = load_data()
-    users = data.setdefault("users", {})
     user = update.message.from_user
-    users[str(user_id)] = {
-        "name": user.full_name,
-        "username": user.username or "",
-        "last_active": datetime.now().isoformat(),
-    }
-    save_data(data)
+    def _track_user(d):
+        d.setdefault("users", {})[str(user_id)] = {
+            "name": user.full_name,
+            "username": user.username or "",
+            "last_active": datetime.now().isoformat(),
+        }
+    update_data(_track_user)
 
     if not doc.file_name.endswith(".zip"):
         await update.message.reply_text(
@@ -673,8 +688,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Extract ZIP
     try:
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(base_folder)
+        _safe_extract(zip_path, base_folder)
     except Exception as e:
         await update.message.reply_text(f"ZIP extraction failed: {e}")
         shutil.rmtree(base_folder, ignore_errors=True)
@@ -689,12 +703,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html_files = [f for f in os.listdir(base_folder) if f.lower().endswith(".html")]
 
     # Save site info
-    sites[site] = {
-        "owner": str(user_id),
-        "created": datetime.now().isoformat(),
-        "files": file_count,
-    }
-    save_data(data)
+    def _save_site(d):
+        d.setdefault("sites", {})[site] = {
+            "owner": str(user_id),
+            "created": datetime.now().isoformat(),
+            "files": file_count,
+        }
+    update_data(_save_site)
 
     link = f"{DOMAIN}/{site}/"
 
