@@ -184,6 +184,8 @@ def api_upload():
         return jsonify({"error": "Only ZIP files allowed"}), 400
 
     site_name = secure_filename(site_name)
+    if not site_name:
+        return jsonify({"error": "Invalid site name"}), 400
     base_folder = os.path.join(WEBSITES_DIR, site_name)
     os.makedirs(base_folder, exist_ok=True)
 
@@ -539,9 +541,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif query.data.startswith("delete_confirm_"):
         site_name = query.data.replace("delete_confirm_", "")
+        user_id = query.from_user.id
         data = load_data()
         sites = data.get("sites", {})
         if site_name in sites:
+            owner = str(sites[site_name].get("owner", ""))
+            if str(user_id) != owner and user_id != ADMIN_ID:
+                await query.message.reply_text("You don't have permission to delete this site.")
+                return
             folder = os.path.join(WEBSITES_DIR, site_name)
             if os.path.exists(folder):
                 shutil.rmtree(folder)
