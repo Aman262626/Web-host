@@ -42,16 +42,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------- DATA STORE ---------------
+_data_lock = threading.Lock()
+
+
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {"sites": {}, "users": {}, "analytics": {}}
+    with _data_lock:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        return {"sites": {}, "users": {}, "analytics": {}}
 
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+    with _data_lock:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+
+
+def update_data(modify_fn):
+    """Atomically read-modify-write data.json."""
+    with _data_lock:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+        else:
+            data = {"sites": {}, "users": {}, "analytics": {}}
+        modify_fn(data)
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        return data
 
 
 # --------------- FLASK APP ---------------
@@ -79,17 +98,21 @@ def serve(site, path=""):
     if site == "api":
         abort(404)
 
+    site = secure_filename(site)
+    if not site:
+        abort(404)
+
     folder = os.path.join(WEBSITES_DIR, site)
     if not os.path.exists(folder):
         return "<h1>404 - Site not found</h1>", 404
 
     # Track visit
-    data = load_data()
-    analytics = data.setdefault("analytics", {})
-    site_stats = analytics.setdefault(site, {"visits": 0, "last_visit": None})
-    site_stats["visits"] += 1
-    site_stats["last_visit"] = datetime.now().isoformat()
-    save_data(data)
+    def _track(data):
+        analytics = data.setdefault("analytics", {})
+        site_stats = analytics.setdefault(site, {"visits": 0, "last_visit": None})
+        site_stats["visits"] += 1
+        site_stats["last_visit"] = datetime.now().isoformat()
+    update_data(_track)
 
     try:
         if path:
