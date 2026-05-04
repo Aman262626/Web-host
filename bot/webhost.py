@@ -124,7 +124,7 @@ def serve(site, path=""):
             if f.lower().endswith(".html"):
                 return send_from_directory(folder, f)
     except Exception as e:
-        return f"<h1>Error: {e}</h1>", 500
+        return "<h1>Internal Server Error</h1>", 500
 
     return "<h1>No HTML file found</h1>", 404
 
@@ -274,11 +274,11 @@ def _flatten_nested_folder(base_folder):
         items = os.listdir(base_folder)
         if len(items) == 1 and os.path.isdir(os.path.join(base_folder, items[0])):
             inner = os.path.join(base_folder, items[0])
-            for f in os.listdir(inner):
-                src = os.path.join(inner, f)
-                dst = os.path.join(base_folder, f)
-                shutil.move(src, dst)
-            os.rmdir(inner)
+            tmp = inner + "_tmp_" + str(int(time.time()))
+            os.rename(inner, tmp)
+            for f in os.listdir(tmp):
+                shutil.move(os.path.join(tmp, f), os.path.join(base_folder, f))
+            os.rmdir(tmp)
         else:
             break
 
@@ -620,7 +620,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     update_data(_track_user)
 
-    if not doc.file_name.endswith(".zip"):
+    if not doc.file_name or not doc.file_name.endswith(".zip"):
         await update.message.reply_text(
             "Only `.zip` files are supported.\n"
             "Please zip your website folder and send again.",
