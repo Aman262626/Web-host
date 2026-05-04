@@ -187,6 +187,8 @@ def api_upload():
     if not site_name:
         return jsonify({"error": "Invalid site name"}), 400
     base_folder = os.path.join(WEBSITES_DIR, site_name)
+    if os.path.exists(base_folder):
+        shutil.rmtree(base_folder)
     os.makedirs(base_folder, exist_ok=True)
 
     zip_path = os.path.join(base_folder, "site.zip")
@@ -368,6 +370,9 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     old_name, new_name = context.args[0], secure_filename(context.args[1])
+    if not new_name:
+        await update.message.reply_text("Invalid new name. Use letters, numbers, and hyphens only.")
+        return
     data = load_data()
     sites = data.get("sites", {})
 
