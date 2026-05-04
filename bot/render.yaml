@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: web-host-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python webhost.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DOMAIN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: API_KEY
+        sync: false
