@@ -8,6 +8,7 @@ import json
 import time
 import shutil
 import zipfile
+import asyncio
 import threading
 import logging
 from datetime import datetime
@@ -743,6 +744,9 @@ def run_bot():
     if not TOKEN:
         logger.error("BOT_TOKEN not set! Set the BOT_TOKEN environment variable.")
         return
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
