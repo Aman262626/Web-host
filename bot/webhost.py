@@ -1,141 +1,114 @@
 """
-Web-Host Bot - Telegram Bot + Flask Web Server
-Upload ZIP files via Telegram or Web UI to instantly deploy websites.
-"""
+Web-Host - Telegram bot + web console + app supervisor.
 
+* Static sites:   upload a ZIP (Telegram or console) -> https://<domain>/<name>/
+* Web services:   Python / Node apps (native or Docker) -> https://<domain>/svc/<name>/
+* Workers:        Telegram bots & background jobs with live logs, env vars, auto-restart
+* Console:        open https://<domain>/ and sign in with ADMIN_PASSWORD
+"""
 import os
-import json
+import hmac
+import html
 import time
-import shutil
-import zipfile
 import asyncio
 import threading
-import logging
-from datetime import datetime
+import tempfile
+from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import quote
 
-from flask import (
-    Flask, send_from_directory, request, jsonify,
-    abort
-)
+from flask import Flask, send_from_directory, request, jsonify, abort, make_response
 from flask_cors import CORS
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
-    MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes,
 )
 from werkzeug.utils import secure_filename
 
-# --------------- CONFIG ---------------
-TOKEN = os.environ.get("BOT_TOKEN", "")
-DOMAIN = os.environ.get("DOMAIN", "http://localhost:8000")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-API_KEY = os.environ.get("API_KEY", "webhost-secret-key")
-WEBSITES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "websites")
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
-MAX_UPLOAD_MB = 50
+import common as C
+import supervisor as S
+import console as console_mod
+from common import logger
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# --------------- DATA STORE ---------------
-_data_lock = threading.Lock()
-
-
-def load_data():
-    with _data_lock:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        return {"sites": {}, "users": {}, "analytics": {}}
-
-
-def save_data(data):
-    with _data_lock:
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-
-
-def update_data(modify_fn):
-    """Atomically read-modify-write data.json."""
-    with _data_lock:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r") as f:
-                data = json.load(f)
-        else:
-            data = {"sites": {}, "users": {}, "analytics": {}}
-        modify_fn(data)
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        return data
-
-
-# --------------- FLASK APP ---------------
 app_web = Flask(__name__)
-app_web.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+app_web.config["MAX_CONTENT_LENGTH"] = max(C.MAX_UPLOAD_MB, 100) * 1024 * 1024
 CORS(app_web)
+app_web.register_blueprint(console_mod.bp)
 user_state = {}
 
-
-@app_web.route("/")
-def home():
-    data = load_data()
-    site_count = len(data.get("sites", {}))
-    return jsonify({
-        "status": "running",
-        "service": "Web-Host",
-        "total_sites": site_count,
-        "version": "2.0",
-    })
+SANDBOX_CSP = ("sandbox allow-scripts allow-forms allow-popups allow-modals "
+               "allow-downloads allow-pointer-lock allow-presentation")
 
 
-# Serve hosted websites
+# =============================================================== HOSTED SITES
 @app_web.route("/<site>/")
 @app_web.route("/<site>/<path:path>")
 def serve(site, path=""):
-    if site == "api":
+    if site in C.RESERVED_NAMES:
         abort(404)
-
-    site = secure_filename(site)
-    if not site:
-        abort(404)
-
-    folder = os.path.join(WEBSITES_DIR, site)
-    if not os.path.exists(folder):
+    data = C.load_data()
+    info = data.get("sites", {}).get(site)
+    if not info:
         return "<h1>404 - Site not found</h1>", 404
-
-    # Track visit
-    def _track(data):
-        analytics = data.setdefault("analytics", {})
-        site_stats = analytics.setdefault(site, {"visits": 0, "last_visit": None})
-        site_stats["visits"] += 1
-        site_stats["last_visit"] = datetime.now().isoformat()
-    update_data(_track)
+    if info.get("expires") and info["expires"] < datetime.now().isoformat():
+        return "<h1>410 - This site has expired</h1>", 410
+    folder = os.path.join(C.WEBSITES_DIR, site)
+    if not os.path.isdir(folder):
+        return "<h1>404 - Site files missing</h1>", 404
 
     try:
-        if path:
-            return send_from_directory(folder, path)
+        target = C.safe_join(folder, path)
+    except ValueError:
+        abort(404)
+    rel = os.path.relpath(target, folder)
+    rel = "" if rel == "." else rel
+    if os.path.isdir(target):
+        idx = os.path.join(target, "index.html")
+        if os.path.isfile(idx):
+            rel = os.path.relpath(idx, folder)
+        elif rel == "":
+            htmls = sorted(f for f in os.listdir(folder) if f.lower().endswith(".html"))
+            if htmls:
+                rel = htmls[0]
+            else:
+                return "<h1>No HTML file found</h1>", 404
+        else:
+            abort(404)
+    elif not os.path.isfile(target):
+        if info.get("spa") and "." not in os.path.basename(path) and os.path.isfile(os.path.join(folder, "index.html")):
+            rel = "index.html"
+        elif os.path.isfile(os.path.join(folder, "404.html")):
+            resp = make_response(send_from_directory(folder, "404.html"))
+            resp.status_code = 404
+            return _site_headers(resp, info)
+        else:
+            return "<h1>404 - File not found</h1>", 404
 
-        # Serve first HTML file found
-        for f in sorted(os.listdir(folder)):
-            if f.lower().endswith(".html"):
-                return send_from_directory(folder, f)
-    except Exception as e:
-        return "<h1>Internal Server Error</h1>", 500
-
-    return "<h1>No HTML file found</h1>", 404
+    resp = make_response(send_from_directory(folder, rel))
+    if (resp.mimetype or "") == "text/html":
+        C.track_visit(site)
+    return _site_headers(resp, info)
 
 
-# --------------- API ENDPOINTS ---------------
+def _site_headers(resp, info):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Uploaded HTML lives on the same origin as the admin console. The CSP sandbox gives each
+    # site an opaque origin so it can never read the admin session. Turn off per site if needed.
+    if info.get("isolation", "sandbox") != "off":
+        resp.headers["Content-Security-Policy"] = SANDBOX_CSP
+    return resp
+
+
+# =============================================================== LEGACY PUBLIC / API-KEY API
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         key = request.headers.get("X-API-Key", "")
-        if key != API_KEY:
+        if not hmac.compare_digest(key.encode(), C.API_KEY.encode()):
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
@@ -143,639 +116,722 @@ def require_api_key(f):
 
 @app_web.route("/api/sites", methods=["GET"])
 def api_list_sites():
-    data = load_data()
-    sites = data.get("sites", {})
+    data = C.load_data()
     analytics = data.get("analytics", {})
-
     result = []
-    for name, info in sites.items():
-        folder = os.path.join(WEBSITES_DIR, name)
-        file_count = 0
-        total_size = 0
-        if os.path.exists(folder):
-            for root, dirs, files in os.walk(folder):
-                file_count += len(files)
-                for fl in files:
-                    total_size += os.path.getsize(os.path.join(root, fl))
-
-        site_analytics = analytics.get(name, {})
+    for name, info in data.get("sites", {}).items():
         result.append({
-            "name": name,
-            "url": f"{DOMAIN}/{name}/",
-            "owner": info.get("owner", "unknown"),
-            "created": info.get("created", ""),
-            "files": file_count,
-            "size_bytes": total_size,
-            "visits": site_analytics.get("visits", 0),
-            "last_visit": site_analytics.get("last_visit"),
+            "name": name, "url": f"{C.DOMAIN}/{name}/", "created": info.get("created", ""),
+            "files": info.get("files", 0), "size_bytes": info.get("size", 0),
+            "visits": analytics.get(name, {}).get("visits", 0),
         })
-
     return jsonify({"sites": result, "total": len(result)})
 
 
 @app_web.route("/api/sites/<site_name>", methods=["DELETE"])
 @require_api_key
 def api_delete_site(site_name):
-    data = load_data()
-    sites = data.get("sites", {})
-
-    if site_name not in sites:
+    if site_name not in C.load_data().get("sites", {}):
         return jsonify({"error": "Site not found"}), 404
-
-    folder = os.path.join(WEBSITES_DIR, site_name)
-    if os.path.exists(folder):
-        shutil.rmtree(folder)
-
-    def _delete(d):
-        d.get("sites", {}).pop(site_name, None)
-        d.get("analytics", {}).pop(site_name, None)
-    update_data(_delete)
-
+    C.delete_site_files(site_name)
     return jsonify({"message": f"Site '{site_name}' deleted"})
 
 
 @app_web.route("/api/upload", methods=["POST"])
 @require_api_key
 def api_upload():
-    if "file" not in request.files:
+    f = request.files.get("file")
+    site_name = C.slugify(request.form.get("site_name", ""))
+    if not f or not f.filename:
         return jsonify({"error": "No file provided"}), 400
-
-    file = request.files["file"]
-    site_name = request.form.get("site_name", "").strip()
-
-    if not site_name:
-        return jsonify({"error": "site_name is required"}), 400
-
-    if not file.filename or not file.filename.endswith(".zip"):
-        return jsonify({"error": "Only ZIP files allowed"}), 400
-
-    site_name = secure_filename(site_name)
-    if not site_name:
+    if not C.valid_name(site_name):
         return jsonify({"error": "Invalid site name"}), 400
-    base_folder = os.path.join(WEBSITES_DIR, site_name)
-    if os.path.exists(base_folder):
-        shutil.rmtree(base_folder)
-    os.makedirs(base_folder, exist_ok=True)
-
-    zip_path = os.path.join(base_folder, "site.zip")
-    file.save(zip_path)
-
+    if not f.filename.lower().endswith(".zip"):
+        return jsonify({"error": "Only ZIP files allowed"}), 400
+    fd, tmp = tempfile.mkstemp(suffix=".zip", dir=console_mod.TMP_DIR)
+    os.close(fd)
     try:
-        _safe_extract(zip_path, base_folder)
+        f.save(tmp)
+        C.deploy_site_zip(tmp, site_name, "api")
     except Exception as e:
-        shutil.rmtree(base_folder, ignore_errors=True)
-        return jsonify({"error": f"ZIP extraction failed: {e}"}), 400
-
-    os.remove(zip_path)
-    _flatten_nested_folder(base_folder)
-
-    def _register(data):
-        data.setdefault("sites", {})[site_name] = {
-            "owner": "web-upload",
-            "created": datetime.now().isoformat(),
-        }
-    update_data(_register)
-
-    link = f"{DOMAIN}/{site_name}/"
-    return jsonify({"message": "Site deployed!", "url": link, "name": site_name})
+        return jsonify({"error": f"Deploy failed: {e}"}), 400
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return jsonify({"message": "Site deployed!", "url": f"{C.DOMAIN}/{site_name}/", "name": site_name})
 
 
 @app_web.route("/api/stats", methods=["GET"])
 def api_stats():
-    data = load_data()
-    sites = data.get("sites", {})
-    analytics = data.get("analytics", {})
-    users = data.get("users", {})
-
-    total_visits = sum(a.get("visits", 0) for a in analytics.values())
-
-    return jsonify({
-        "total_sites": len(sites),
-        "total_users": len(users),
-        "total_visits": total_visits,
-        "uptime": "running",
-    })
+    data = C.load_data()
+    total = sum(a.get("visits", 0) for a in data.get("analytics", {}).values())
+    return jsonify({"total_sites": len(data.get("sites", {})), "total_users": len(data.get("users", {})),
+                    "total_visits": total, "uptime": "running"})
 
 
-# --------------- HELPERS ---------------
-def _safe_extract(zip_path, target_dir):
-    """Extract ZIP safely, rejecting entries with path traversal."""
-    real_target = os.path.realpath(target_dir)
-    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        for member in zip_ref.namelist():
-            member_path = os.path.realpath(os.path.join(target_dir, member))
-            if not member_path.startswith(real_target + os.sep) and member_path != real_target:
-                raise ValueError(f"Illegal path in ZIP: {member}")
-        zip_ref.extractall(target_dir)
+# =============================================================== TELEGRAM BOT
+def is_admin(uid):
+    return bool(C.ADMIN_ID) and uid == C.ADMIN_ID
 
 
-def _flatten_nested_folder(base_folder):
-    """Flatten single nested directory inside extracted ZIP."""
-    while True:
-        items = os.listdir(base_folder)
-        if len(items) == 1 and os.path.isdir(os.path.join(base_folder, items[0])):
-            inner = os.path.join(base_folder, items[0])
-            tmp = inner + "_tmp_" + str(int(time.time()))
-            os.rename(inner, tmp)
-            for f in os.listdir(tmp):
-                shutil.move(os.path.join(tmp, f), os.path.join(base_folder, f))
-            os.rmdir(tmp)
-        else:
-            break
+def esc(x):
+    return html.escape(str(x))
 
 
-def _get_site_list(user_id=None):
-    """Get formatted list of sites for a user or all sites."""
-    data = load_data()
-    sites = data.get("sites", {})
-    analytics = data.get("analytics", {})
+def guard(admin_only=False):
+    """Registers the user, blocks banned users, optionally admin-only."""
+    def deco(fn):
+        @wraps(fn)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user = update.effective_user
+            if not user:
+                return
+            data = C.load_data()
+            if str(user.id) in map(str, data.get("banned", [])) and not is_admin(user.id):
+                if update.effective_message:
+                    await update.effective_message.reply_text("🚫 You are banned from this bot.")
+                return
+            if admin_only and not is_admin(user.id):
+                msg = update.effective_message
+                if update.callback_query:
+                    await update.callback_query.answer("Admin only", show_alert=True)
+                elif msg:
+                    await msg.reply_text("🔒 Admin only command.")
+                return
 
-    if not sites:
-        return "No sites deployed yet."
-
-    lines = []
-    for name, info in sites.items():
-        if user_id and str(info.get("owner")) != str(user_id):
-            continue
-        visits = analytics.get(name, {}).get("visits", 0)
-        link = f"{DOMAIN}/{name}/"
-        lines.append(f"  {name}\n     {link}\n     Visits: {visits}")
-
-    if not lines:
-        return "You have no deployed sites."
-
-    return "\n\n".join(lines)
+            def _track(d):
+                prev = d.setdefault("users", {}).get(str(user.id), {})
+                d["users"][str(user.id)] = {**prev, "name": user.full_name, "username": user.username or "",
+                                            "last_active": datetime.now().isoformat(timespec="seconds")}
+            C.update_data(_track)
+            return await fn(update, context)
+        return wrapper
+    return deco
 
 
-# --------------- FLASK SERVER ---------------
-def run_web():
-    app_web.run(host="0.0.0.0", port=8000, threaded=True, debug=False)
+def _user_sites(uid):
+    return {n: i for n, i in C.load_data().get("sites", {}).items() if str(i.get("owner")) == str(uid)}
 
 
-# --------------- TELEGRAM BOT ---------------
+def _site_card(name):
+    data = C.load_data()
+    info = data.get("sites", {}).get(name)
+    if not info:
+        return None, None
+    a = data.get("analytics", {}).get(name, {})
+    daily = a.get("daily", {})
+    week = sum(daily.get((datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d"), 0) for i in range(7))
+    url = f"{C.DOMAIN}/{name}/"
+    exp = info.get("expires")
+    text = (f"🌐 <b>{esc(name)}</b>\n{esc(url)}\n\n"
+            f"📁 Files: {info.get('files', 0)}  •  💾 {C.fmt_bytes(info.get('size', 0))}\n"
+            f"👁 Visits: {a.get('visits', 0)} (last 7 days: {week})\n"
+            f"🕒 Updated: {esc((info.get('updated') or info.get('created') or '')[:16].replace('T', ' '))}")
+    if exp:
+        text += f"\n⏳ Expires: {esc(exp[:16].replace('T', ' '))}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Open", url=url), InlineKeyboardButton("QR code", callback_data=f"qr:{name}")],
+        [InlineKeyboardButton("Delete", callback_data=f"delask:{name}")],
+    ])
+    return text, kb
+
+
+@guard()
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [
-            InlineKeyboardButton("Upload Site", callback_data="upload"),
-            InlineKeyboardButton("My Sites", callback_data="mysites"),
-        ],
-        [
-            InlineKeyboardButton("Help", callback_data="help"),
-            InlineKeyboardButton("Stats", callback_data="stats"),
-        ],
+    uid = update.effective_user.id
+    rows = [
+        [InlineKeyboardButton("📤 Upload site", callback_data="upload"), InlineKeyboardButton("🗂 My sites", callback_data="mysites")],
+        [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("❓ Help", callback_data="help")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    if is_admin(uid):
+        rows.append([InlineKeyboardButton("🖥 Open console", url=C.DOMAIN + "/"),
+                     InlineKeyboardButton("⚙️ Services", callback_data="services")])
     await update.message.reply_text(
-        "**Web-Host Bot**\n\n"
-        "Host your website in seconds!\n\n"
-        " Send a ZIP file to deploy\n"
-        " Manage your sites easily\n"
-        " Get instant live links\n\n"
-        "Choose an option below or send a ZIP file:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
-    )
+        "<b>Web-Host</b> 🚀\n\nSend me a <b>ZIP</b> of your website and get a live link in seconds.\n"
+        "Tip: add the site name as the file caption to deploy instantly.",
+        reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
 
+HELP_USER = (
+    "<b>Commands</b>\n"
+    "/start - main menu\n/mysites - your sites\n/info &lt;name&gt; - site details & visits\n"
+    "/qr &lt;name&gt; - QR code for your link\n/rename &lt;old&gt; &lt;new&gt;\n/delete &lt;name&gt;\n"
+    "/expire &lt;name&gt; &lt;hours|off&gt; - auto-delete a site later\n/stats - your statistics\n\n"
+    "<b>Deploy</b>\nSend a ZIP file. Add a caption to use it as the site name."
+)
+HELP_ADMIN = (
+    "\n\n<b>Admin</b>\n/panel - open web console\n/status - server health\n/services - manage apps & bots\n"
+    "/logs &lt;svc&gt; [lines]\n/deploy &lt;svc&gt;\n/svcstart | /svcstop | /restart &lt;svc&gt;\n"
+    "/env &lt;svc&gt; - list variable names\n/setenv &lt;svc&gt; KEY value\n/unsetenv &lt;svc&gt; KEY\n"
+    "/allusers /allsites /broadcast &lt;msg&gt;\n/ban &lt;id&gt; /unban &lt;id&gt;"
+)
+
+
+@guard()
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "**Commands:**\n\n"
-        "/start - Main menu\n"
-        "/help - Show this help\n"
-        "/mysites - List your sites\n"
-        "/delete `<name>` - Delete a site\n"
-        "/rename `<old>` `<new>` - Rename a site\n"
-        "/stats - View statistics\n\n"
-        "**How to deploy:**\n"
-        "1. Send a ZIP file containing your website\n"
-        "2. Enter a name for your site\n"
-        "3. Get your live link!\n\n"
-        "**Supported:** HTML, CSS, JS, images, fonts"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    text = HELP_USER + (HELP_ADMIN if is_admin(update.effective_user.id) else "")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+@guard()
 async def cmd_mysites(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    site_list = _get_site_list(user_id)
-    await update.message.reply_text(
-        f"**Your Sites:**\n\n{site_list}",
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
+    await _send_mysites(update.message, update.effective_user.id)
 
 
+async def _send_mysites(message, uid):
+    sites = _user_sites(uid)
+    if not sites:
+        await message.reply_text("You have no sites yet. Send me a ZIP file! 📦")
+        return
+    an = C.load_data().get("analytics", {})
+    rows = [[InlineKeyboardButton(f"{n}  •  {an.get(n, {}).get('visits', 0)} 👁", callback_data=f"site:{n}")] for n in list(sites)[:30]]
+    await message.reply_text(f"<b>Your sites ({len(sites)}/{C.MAX_SITES_PER_USER})</b>\nTap one for details:",
+                             reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+
+def _can_manage(uid, name):
+    info = C.load_data().get("sites", {}).get(name)
+    return bool(info) and (str(info.get("owner")) == str(uid) or is_admin(uid))
+
+
+@guard()
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /info <site_name>")
+    name = context.args[0].lower()
+    if not _can_manage(update.effective_user.id, name):
+        return await update.message.reply_text("Site not found (or not yours).")
+    text, kb = _site_card(name)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def _send_qr(message, name):
+    url = f"{C.DOMAIN}/{name}/"
+    await message.reply_photo(f"https://api.qrserver.com/v1/create-qr-code/?size=500x500&margin=20&data={quote(url)}",
+                              caption=url)
+
+
+@guard()
+async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /qr <site_name>")
+    name = context.args[0].lower()
+    if not _can_manage(update.effective_user.id, name):
+        return await update.message.reply_text("Site not found (or not yours).")
+    await _send_qr(update.message, name)
+
+
+def _remove_site(name):
+    C.delete_site_files(name)
+
+
+@guard()
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     if not context.args:
-        await update.message.reply_text("Usage: /delete `<site_name>`", parse_mode="Markdown")
-        return
-
-    site_name = context.args[0]
-    data = load_data()
-    sites = data.get("sites", {})
-
-    if site_name not in sites:
-        await update.message.reply_text(f"Site '{site_name}' not found.")
-        return
-
-    # Only owner or admin can delete
-    owner = str(sites[site_name].get("owner", ""))
-    if str(user_id) != owner and user_id != ADMIN_ID:
-        await update.message.reply_text("You don't have permission to delete this site.")
-        return
-
-    folder = os.path.join(WEBSITES_DIR, site_name)
-    if os.path.exists(folder):
-        shutil.rmtree(folder)
-
-    def _del(d):
-        d.get("sites", {}).pop(site_name, None)
-        d.get("analytics", {}).pop(site_name, None)
-    update_data(_del)
-
-    await update.message.reply_text(f"Site '{site_name}' has been deleted.")
+        return await update.message.reply_text("Usage: /delete <site_name>")
+    name = context.args[0].lower()
+    if not _can_manage(update.effective_user.id, name):
+        return await update.message.reply_text("Site not found (or not yours).")
+    _remove_site(name)
+    await update.message.reply_text(f"🗑 Site '{name}' deleted.")
 
 
+@guard()
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /rename `<old_name>` `<new_name>`", parse_mode="Markdown"
-        )
-        return
+        return await update.message.reply_text("Usage: /rename <old_name> <new_name>")
+    old, new = context.args[0].lower(), C.slugify(context.args[1])
+    if not _can_manage(update.effective_user.id, old):
+        return await update.message.reply_text("Site not found (or not yours).")
+    sites = C.load_data().get("sites", {})
+    if not C.valid_name(new) or new in sites or S.get_cfg(new):
+        return await update.message.reply_text("Invalid or already used name (2-41 chars: a-z, 0-9, -).")
+    import shutil
+    src = os.path.join(C.WEBSITES_DIR, old)
+    if os.path.isdir(src):
+        shutil.move(src, os.path.join(C.WEBSITES_DIR, new))
 
-    old_name, new_name = context.args[0], secure_filename(context.args[1])
-    if not new_name:
-        await update.message.reply_text("Invalid new name. Use letters, numbers, and hyphens only.")
-        return
-    data = load_data()
-    sites = data.get("sites", {})
-
-    if old_name not in sites:
-        await update.message.reply_text(f"Site '{old_name}' not found.")
-        return
-
-    owner = str(sites[old_name].get("owner", ""))
-    if str(user_id) != owner and user_id != ADMIN_ID:
-        await update.message.reply_text("You don't have permission to rename this site.")
-        return
-
-    if new_name in sites:
-        await update.message.reply_text(f"Site '{new_name}' already exists.")
-        return
-
-    old_folder = os.path.join(WEBSITES_DIR, old_name)
-    new_folder = os.path.join(WEBSITES_DIR, new_name)
-
-    if os.path.exists(old_folder):
-        shutil.move(old_folder, new_folder)
-
-    def _rename(d):
-        s = d.get("sites", {})
-        if old_name in s:
-            s[new_name] = s.pop(old_name)
-        a = d.get("analytics", {})
-        if old_name in a:
-            a[new_name] = a.pop(old_name)
-    update_data(_rename)
-
-    link = f"{DOMAIN}/{new_name}/"
-    await update.message.reply_text(
-        f"Site renamed!\n\n"
-        f"Old: {old_name}\n"
-        f"New: {new_name}\n"
-        f"Link: {link}"
-    )
+    def _m(d):
+        d["sites"][new] = d["sites"].pop(old)
+        if old in d["analytics"]:
+            d["analytics"][new] = d["analytics"].pop(old)
+    C.update_data(_m)
+    await update.message.reply_text(f"✅ Renamed.\n{old} → {new}\n{C.DOMAIN}/{new}/", disable_web_page_preview=True)
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    sites = data.get("sites", {})
-    analytics = data.get("analytics", {})
-    users = data.get("users", {})
-    total_visits = sum(a.get("visits", 0) for a in analytics.values())
-
-    user_id = update.message.from_user.id
-    if user_id == ADMIN_ID:
-        text = (
-            f"**Admin Stats**\n\n"
-            f"Total Sites: {len(sites)}\n"
-            f"Total Users: {len(users)}\n"
-            f"Total Visits: {total_visits}\n\n"
-            f"**Top Sites:**\n"
-        )
-        sorted_sites = sorted(
-            analytics.items(), key=lambda x: x[1].get("visits", 0), reverse=True
-        )[:5]
-        for name, stats in sorted_sites:
-            text += f"  {name}: {stats.get('visits', 0)} visits\n"
+@guard()
+async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("Usage: /expire <site> <hours|off>\nExample: /expire mysite 24")
+    name, val = context.args[0].lower(), context.args[1].lower()
+    if not _can_manage(update.effective_user.id, name):
+        return await update.message.reply_text("Site not found (or not yours).")
+    if val in ("off", "0", "never"):
+        exp = None
     else:
-        user_sites = {k: v for k, v in sites.items() if str(v.get("owner")) == str(user_id)}
-        user_visits = sum(analytics.get(name, {}).get("visits", 0) for name in user_sites)
-        text = (
-            f"**Your Stats**\n\n"
-            f"Your Sites: {len(user_sites)}\n"
-            f"Total Visits: {user_visits}\n"
-        )
+        try:
+            hours = float(val)
+            if not 0 < hours <= 24 * 365:
+                raise ValueError
+        except ValueError:
+            return await update.message.reply_text("Hours must be a positive number, or 'off'.")
+        exp = (datetime.now() + timedelta(hours=hours)).isoformat()
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    def _m(d):
+        d["sites"][name]["expires"] = exp
+    C.update_data(_m)
+    await update.message.reply_text("⏳ Auto-delete removed." if not exp else f"⏳ '{name}' will be deleted on {exp[:16].replace('T', ' ')}.")
 
 
-# Admin-only commands
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("Admin only command.")
-        return
+@guard()
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = C.load_data()
+    sites, an = data.get("sites", {}), data.get("analytics", {})
+    uid = update.effective_user.id
+    if is_admin(uid):
+        total = sum(a.get("visits", 0) for a in an.values())
+        top = sorted(an.items(), key=lambda x: x[1].get("visits", 0), reverse=True)[:5]
+        text = (f"<b>Admin stats</b>\n\nSites: {len(sites)}\nUsers: {len(data.get('users', {}))}\nVisits: {total}\n"
+                f"Services: {len(S.get_state()['services'])}\n\n<b>Top sites</b>\n" +
+                "\n".join(f"• {esc(n)}: {s.get('visits', 0)}" for n, s in top))
+    else:
+        mine = _user_sites(uid)
+        text = (f"<b>Your stats</b>\n\nSites: {len(mine)}/{C.MAX_SITES_PER_USER}\n"
+                f"Visits: {sum(an.get(n, {}).get('visits', 0) for n in mine)}")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
+
+# ---- admin: server & services
+@guard(admin_only=True)
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Web console:", reply_markup=InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🖥 Open console", url=C.DOMAIN + "/")]]))
+
+
+def _fmt_dur(s):
+    s = int(s)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, _ = divmod(s, 60)
+    return (f"{d}d " if d else "") + (f"{h}h " if h else "") + f"{m}m"
+
+
+@guard(admin_only=True)
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sy = S.system_stats()
+    caps = S.capabilities()
+    svcs = S.get_state()["services"]
+    lines = [f"{_status_icon(S.status_of(n))} {esc(n)} - {S.status_of(n)}" for n in svcs] or ["(no services)"]
+    text = (f"<b>Server</b>\nUptime: {_fmt_dur(time.time() - C.STARTED_AT)}\n"
+            f"CPU: {sy['cpu']:.0f}%  •  RAM: {sy['mem_percent']:.0f}%  •  Disk: {sy['disk']['percent']:.0f}%\n"
+            f"Docker: {'✅' if caps['docker'] else '❌'}  Git: {'✅' if caps['git'] else '❌'}  Node: {esc(caps['node'] or '❌')}\n\n"
+            f"<b>Services</b>\n" + "\n".join(lines))
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def _status_icon(st):
+    return {"running": "🟢", "building": "🟡", "restarting": "🟡", "failed": "🔴", "crashed": "🔴"}.get(st, "⚪")
+
+
+def _svc_keyboard():
+    rows = []
+    for n in S.get_state()["services"]:
+        rows.append([InlineKeyboardButton(f"{_status_icon(S.status_of(n))} {n}", callback_data=f"svc:menu:{n}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _svc_actions(name):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Start", callback_data=f"svc:start:{name}"),
+         InlineKeyboardButton("⏹ Stop", callback_data=f"svc:stop:{name}"),
+         InlineKeyboardButton("🔄 Restart", callback_data=f"svc:restart:{name}")],
+        [InlineKeyboardButton("🚀 Redeploy", callback_data=f"svc:deploy:{name}"),
+         InlineKeyboardButton("📜 Logs", callback_data=f"svc:logs:{name}")],
+        [InlineKeyboardButton("« Back", callback_data="services")],
+    ])
+
+
+@guard(admin_only=True)
+async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = _svc_keyboard()
+    await update.message.reply_text("<b>Services</b>" if kb else "No services yet. Create one in the console.",
+                                    reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _send_logs(message, name, lines=30):
+    if not S.get_cfg(name):
+        return await message.reply_text("Service not found.")
+    txt = S.read_log(S.runtime_log(name), None, 24000)["text"].strip().splitlines()[-lines:]
+    body = "\n".join(txt)[-3500:] or "(no logs yet)"
+    await message.reply_text(f"<b>{esc(name)}</b> logs\n<pre>{esc(body)}</pre>", parse_mode=ParseMode.HTML)
+
+
+@guard(admin_only=True)
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
+        return await update.message.reply_text("Usage: /logs <service> [lines]")
+    n = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 30
+    await _send_logs(update.message, context.args[0].lower(), min(n, 80))
 
-    message = " ".join(context.args)
-    data = load_data()
-    users = data.get("users", {})
+
+def _svc_cmd(action):
+    @guard(admin_only=True)
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            return await update.message.reply_text(f"Usage: /{update.message.text.split()[0][1:]} <service>")
+        name = context.args[0].lower()
+        res = await asyncio.get_running_loop().run_in_executor(None, _do_svc_action, action, name)
+        await update.message.reply_text(res)
+    return handler
+
+
+def _do_svc_action(action, name):
+    if not S.get_cfg(name):
+        return "Service not found."
+    try:
+        if action == "start":
+            S.start(name)
+        elif action == "stop":
+            S.stop(name)
+        elif action == "restart":
+            S.restart(name)
+        elif action == "deploy":
+            dep = S.deploy(name, "telegram")
+            return f"🚀 Deploy #{dep} started for {name}. I'll message you when it finishes."
+        return f"✅ {action} → {name}: {S.status_of(name)}"
+    except Exception as e:
+        return f"❌ {e}"
+
+
+@guard(admin_only=True)
+async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /env <service>")
+    cfg = S.get_cfg(context.args[0].lower())
+    if not cfg:
+        return await update.message.reply_text("Service not found.")
+    keys = sorted((cfg.get("env") or {}).keys())
+    await update.message.reply_text("Variables (values hidden):\n" + ("\n".join(f"• {k}" for k in keys) or "(none)"))
+
+
+@guard(admin_only=True)
+async def cmd_setenv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = update.message.text.split(None, 3)
+    if len(parts) < 4:
+        return await update.message.reply_text("Usage: /setenv <service> KEY value")
+    name, key, val = parts[1].lower(), parts[2], parts[3]
+    cfg = S.get_cfg(name)
+    if not cfg:
+        return await update.message.reply_text("Service not found.")
+    import re
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+        return await update.message.reply_text("Invalid variable name.")
+    env = dict(cfg.get("env") or {})
+    env[key] = val
+    S.update_cfg(name, env=env)
+    try:
+        await update.message.delete()  # remove the secret from the chat
+    except Exception:
+        pass
+    await context.bot.send_message(update.effective_chat.id,
+                                   f"✅ {key} saved for {name}. Message deleted. Restart the service to apply.",
+                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Restart now", callback_data=f"svc:restart:{name}")]]))
+
+
+@guard(admin_only=True)
+async def cmd_unsetenv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("Usage: /unsetenv <service> KEY")
+    name, key = context.args[0].lower(), context.args[1]
+    cfg = S.get_cfg(name)
+    if not cfg:
+        return await update.message.reply_text("Service not found.")
+    env = dict(cfg.get("env") or {})
+    env.pop(key, None)
+    S.update_cfg(name, env=env)
+    await update.message.reply_text(f"🗑 {key} removed from {name}.")
+
+
+@guard(admin_only=True)
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /broadcast <message>")
+    msg = " ".join(context.args)
+    users = C.load_data().get("users", {})
     sent = 0
-
     for uid in users:
         try:
-            await context.bot.send_message(chat_id=int(uid), text=f"**Announcement:**\n{message}", parse_mode="Markdown")
+            await context.bot.send_message(chat_id=int(uid), text=f"📢 {msg}")
             sent += 1
         except Exception:
             pass
-
+        await asyncio.sleep(0.05)
     await update.message.reply_text(f"Broadcast sent to {sent}/{len(users)} users.")
 
 
+@guard(admin_only=True)
 async def cmd_allusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("Admin only command.")
-        return
-
-    data = load_data()
-    users = data.get("users", {})
-
+    users = C.load_data().get("users", {})
     if not users:
-        await update.message.reply_text("No users registered yet.")
-        return
-
-    text = "**All Users:**\n\n"
-    for uid, info in users.items():
-        name = info.get("name", "Unknown")
-        username = info.get("username", "N/A")
-        text += f"  {name} (@{username}) - ID: {uid}\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
+        return await update.message.reply_text("No users yet.")
+    lines = [f"{esc(u.get('name', '?'))} (@{esc(u.get('username') or '-')}) <code>{uid}</code>" for uid, u in list(users.items())[:60]]
+    await update.message.reply_text(f"<b>Users ({len(users)})</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@guard(admin_only=True)
 async def cmd_allsites(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("Admin only command.")
-        return
-
-    site_list = _get_site_list()
-    await update.message.reply_text(
-        f"**All Sites:**\n\n{site_list}",
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
+    data = C.load_data()
+    sites = data.get("sites", {})
+    if not sites:
+        return await update.message.reply_text("No sites yet.")
+    lines = [f"• {esc(n)} - {data['analytics'].get(n, {}).get('visits', 0)} visits (owner {esc(i.get('owner'))})" for n, i in list(sites.items())[:60]]
+    await update.message.reply_text(f"<b>All sites ({len(sites)})</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-# Callback query handler for inline buttons
+def _ban_cmd(ban):
+    @guard(admin_only=True)
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args or not context.args[0].isdigit():
+            return await update.message.reply_text(f"Usage: /{'ban' if ban else 'unban'} <user_id>")
+        uid = context.args[0]
+
+        def _m(d):
+            b = [str(x) for x in d.setdefault("banned", [])]
+            if ban and uid not in b:
+                b.append(uid)
+            if not ban and uid in b:
+                b.remove(uid)
+            d["banned"] = b
+        C.update_data(_m)
+        await update.message.reply_text(f"{'🚫 Banned' if ban else '✅ Unbanned'} {uid}")
+    return handler
+
+
+# ---- callbacks
+@guard()
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    data = q.data or ""
+    uid = q.from_user.id
+    await q.answer()
+    msg = q.message
 
-    if query.data == "upload":
-        await query.message.reply_text("Send your website ZIP file now!")
-    elif query.data == "mysites":
-        user_id = query.from_user.id
-        site_list = _get_site_list(user_id)
-        await query.message.reply_text(
-            f"**Your Sites:**\n\n{site_list}",
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-    elif query.data == "help":
-        await query.message.reply_text(
-            "**Commands:**\n"
-            "/start - Main menu\n"
-            "/mysites - Your sites\n"
-            "/delete `<name>` - Delete site\n"
-            "/rename `<old>` `<new>` - Rename\n"
-            "/stats - Statistics\n\n"
-            "Just send a ZIP file to deploy!",
-            parse_mode="Markdown",
-        )
-    elif query.data == "stats":
-        data = load_data()
-        sites = data.get("sites", {})
-        analytics = data.get("analytics", {})
-        user_id = query.from_user.id
-        user_sites = {k: v for k, v in sites.items() if str(v.get("owner")) == str(user_id)}
-        user_visits = sum(analytics.get(name, {}).get("visits", 0) for name in user_sites)
-        await query.message.reply_text(
-            f"**Your Stats**\n\n"
-            f"Sites: {len(user_sites)}\n"
-            f"Visits: {user_visits}",
-            parse_mode="Markdown",
-        )
-    elif query.data.startswith("delete_confirm_"):
-        site_name = query.data.replace("delete_confirm_", "")
-        user_id = query.from_user.id
-        data = load_data()
-        sites = data.get("sites", {})
-        if site_name in sites:
-            owner = str(sites[site_name].get("owner", ""))
-            if str(user_id) != owner and user_id != ADMIN_ID:
-                await query.message.reply_text("You don't have permission to delete this site.")
-                return
-            folder = os.path.join(WEBSITES_DIR, site_name)
-            if os.path.exists(folder):
-                shutil.rmtree(folder)
-            def _del_cb(d):
-                d.get("sites", {}).pop(site_name, None)
-                d.get("analytics", {}).pop(site_name, None)
-            update_data(_del_cb)
-            await query.message.reply_text(f"Site '{site_name}' deleted.")
+    if data == "upload":
+        await msg.reply_text("Send your website ZIP file now! 📦")
+    elif data == "mysites":
+        await _send_mysites(msg, uid)
+    elif data == "help":
+        await msg.reply_text(HELP_USER + (HELP_ADMIN if is_admin(uid) else ""), parse_mode=ParseMode.HTML)
+    elif data == "stats":
+        mine = _user_sites(uid)
+        an = C.load_data().get("analytics", {})
+        await msg.reply_text(f"Sites: {len(mine)}/{C.MAX_SITES_PER_USER}\nVisits: {sum(an.get(n, {}).get('visits', 0) for n in mine)}")
+    elif data.startswith("site:"):
+        name = data[5:]
+        if not _can_manage(uid, name):
+            return await msg.reply_text("Site not found.")
+        text, kb = _site_card(name)
+        await msg.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    elif data.startswith("qr:"):
+        name = data[3:]
+        if _can_manage(uid, name):
+            await _send_qr(msg, name)
+    elif data.startswith("delask:"):
+        name = data[7:]
+        if _can_manage(uid, name):
+            await msg.reply_text(f"Delete '{name}' permanently?", reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Yes, delete", callback_data=f"delete_confirm_{name}"),
+                InlineKeyboardButton("Cancel", callback_data="noop")]]))
+    elif data.startswith("delete_confirm_"):
+        name = data[len("delete_confirm_"):]
+        if not _can_manage(uid, name):
+            return await msg.reply_text("Site not found or no permission.")
+        _remove_site(name)
+        await msg.reply_text(f"🗑 Site '{name}' deleted.")
+    elif data.startswith("usename:"):
+        name = data[8:]
+        await _finish_deploy(update, context, uid, name, msg)
+    elif data == "services" and is_admin(uid):
+        kb = _svc_keyboard()
+        await msg.reply_text("<b>Services</b>" if kb else "No services yet.", reply_markup=kb, parse_mode=ParseMode.HTML)
+    elif data.startswith("svc:") and is_admin(uid):
+        _, action, name = data.split(":", 2)
+        if action == "menu":
+            cfg = S.get_cfg(name)
+            if not cfg:
+                return await msg.reply_text("Service not found.")
+            st = S.status_of(name)
+            await msg.reply_text(f"{_status_icon(st)} <b>{esc(name)}</b>\n{esc(cfg['kind'])} • {esc(cfg.get('runtime_used') or cfg['runtime'])} • {st}",
+                                 reply_markup=_svc_actions(name), parse_mode=ParseMode.HTML)
+        elif action == "logs":
+            await _send_logs(msg, name)
         else:
-            await query.message.reply_text("Site not found.")
+            res = await asyncio.get_running_loop().run_in_executor(None, _do_svc_action, action, name)
+            await msg.reply_text(res)
 
 
-# Handle ZIP file uploads
+# ---- ZIP upload flow
+@guard()
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    user_id = update.message.from_user.id
-
-    # Track user
-    user = update.message.from_user
-    def _track_user(d):
-        d.setdefault("users", {})[str(user_id)] = {
-            "name": user.full_name,
-            "username": user.username or "",
-            "last_active": datetime.now().isoformat(),
-        }
-    update_data(_track_user)
-
-    if not doc.file_name or not doc.file_name.endswith(".zip"):
-        await update.message.reply_text(
-            "Only `.zip` files are supported.\n"
-            "Please zip your website folder and send again.",
-            parse_mode="Markdown",
-        )
-        return
-
-    file_size_mb = doc.file_size / (1024 * 1024)
-    if file_size_mb > MAX_UPLOAD_MB:
-        await update.message.reply_text(
-            f"File too large! Max size: {MAX_UPLOAD_MB}MB\n"
-            f"Your file: {file_size_mb:.1f}MB"
-        )
-        return
-
-    user_state[user_id] = {
-        "file_id": doc.file_id,
-        "file_name": doc.file_name,
-        "file_size": doc.file_size,
-    }
-
-    await update.message.reply_text(
-        f"ZIP received: `{doc.file_name}` ({file_size_mb:.1f}MB)\n\n"
-        "Now enter a name for your website:",
-        parse_mode="Markdown",
-    )
+    uid = update.effective_user.id
+    if not doc.file_name or not doc.file_name.lower().endswith(".zip"):
+        return await update.message.reply_text("Only .zip files are supported. Zip your website folder and send again.")
+    mb = doc.file_size / (1024 * 1024)
+    if mb > C.MAX_UPLOAD_MB:
+        return await update.message.reply_text(f"File too large! Max {C.MAX_UPLOAD_MB}MB, yours is {mb:.1f}MB.")
+    if not is_admin(uid) and len(_user_sites(uid)) >= C.MAX_SITES_PER_USER:
+        return await update.message.reply_text(f"You reached the limit of {C.MAX_SITES_PER_USER} sites. Delete one first (/mysites).")
+    user_state[uid] = {"file_id": doc.file_id, "file_name": doc.file_name, "file_size": doc.file_size}
+    caption = C.slugify(update.message.caption or "")
+    if caption and C.valid_name(caption):
+        return await _finish_deploy(update, context, uid, caption, update.message)
+    suggestion = C.slugify(os.path.splitext(doc.file_name)[0])
+    kb = None
+    if C.valid_name(suggestion):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Use '{suggestion}'", callback_data=f"usename:{suggestion}")]])
+    await update.message.reply_text(f"📦 Got <code>{esc(doc.file_name)}</code> ({mb:.1f}MB)\n\nType a name for your site (a-z, 0-9, -):",
+                                    reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-# Handle site name input
+@guard()
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-
-    if user_id not in user_state:
+    uid = update.effective_user.id
+    if uid not in user_state:
         return
+    site = C.slugify(update.message.text)
+    if not C.valid_name(site):
+        return await update.message.reply_text("Invalid name. Use 2-41 letters, numbers and hyphens (not reserved words).")
+    await _finish_deploy(update, context, uid, site, update.message)
 
-    site = secure_filename(update.message.text.strip())
-    if not site:
-        await update.message.reply_text("Invalid name. Use letters, numbers, and hyphens only.")
-        return
 
-    data = load_data()
-    sites = data.setdefault("sites", {})
-
-    if site in sites and str(sites[site].get("owner")) != str(user_id) and user_id != ADMIN_ID:
-        await update.message.reply_text(
-            f"Site name '{site}' is already taken. Choose another name."
-        )
-        return
-
-    await update.message.reply_text("Deploying your site...")
-
-    base_folder = os.path.join(WEBSITES_DIR, site)
-    if os.path.exists(base_folder):
-        shutil.rmtree(base_folder)
-    os.makedirs(base_folder, exist_ok=True)
-
-    # Download ZIP
+async def _finish_deploy(update, context, uid, site, message):
+    st = user_state.get(uid)
+    if not st:
+        return await message.reply_text("Send a ZIP file first.")
+    sites = C.load_data().get("sites", {})
+    if site in sites and str(sites[site].get("owner")) != str(uid) and not is_admin(uid):
+        return await message.reply_text(f"'{site}' is already taken. Choose another name.")
+    if S.get_cfg(site):
+        return await message.reply_text(f"'{site}' is already taken. Choose another name.")
+    status = await message.reply_text("⏳ Downloading...")
+    fd, tmp = tempfile.mkstemp(suffix=".zip", dir=console_mod.TMP_DIR)
+    os.close(fd)
     try:
-        file = await context.bot.get_file(user_state[user_id]["file_id"])
-        zip_path = os.path.join(base_folder, "site.zip")
-        await file.download_to_drive(zip_path)
+        tgfile = await context.bot.get_file(st["file_id"])
+        await tgfile.download_to_drive(tmp)
+        await status.edit_text("⚙️ Extracting & deploying...")
+        info = await asyncio.get_running_loop().run_in_executor(None, C.deploy_site_zip, tmp, site, uid)
     except Exception as e:
-        await update.message.reply_text(f"Download failed: {e}")
-        del user_state[user_id]
-        return
+        user_state.pop(uid, None)
+        return await status.edit_text(f"❌ Deploy failed: {e}")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    user_state.pop(uid, None)
+    link = f"{C.DOMAIN}/{site}/"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Open site", url=link), InlineKeyboardButton("QR code", callback_data=f"qr:{site}")],
+        [InlineKeyboardButton("My sites", callback_data="mysites"), InlineKeyboardButton("Delete", callback_data=f"delask:{site}")],
+    ])
+    warn = "" if info["html"] else "\n⚠️ No .html file in the root - make sure index.html exists."
+    await status.edit_text(
+        f"✅ <b>Site deployed!</b>\n\nName: <code>{esc(site)}</code>\nLink: {esc(link)}\n"
+        f"Files: {info['files']} • {C.fmt_bytes(info['size'])}{warn}",
+        reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-    # Extract ZIP
-    try:
-        _safe_extract(zip_path, base_folder)
-    except Exception as e:
-        await update.message.reply_text(f"ZIP extraction failed: {e}")
-        shutil.rmtree(base_folder, ignore_errors=True)
-        del user_state[user_id]
-        return
 
-    os.remove(zip_path)
-    _flatten_nested_folder(base_folder)
+async def on_error(update, context):
+    logger.error("Bot error", exc_info=context.error)
+    console_mod.BOT_STATE["error"] = str(context.error)[:200]
 
-    # Count files
-    file_count = sum(len(files) for _, _, files in os.walk(base_folder))
-    html_files = [f for f in os.listdir(base_folder) if f.lower().endswith(".html")]
 
-    # Save site info
-    def _save_site(d):
-        d.setdefault("sites", {})[site] = {
-            "owner": str(user_id),
-            "created": datetime.now().isoformat(),
-            "files": file_count,
-        }
-    update_data(_save_site)
-
-    link = f"{DOMAIN}/{site}/"
-
-    keyboard = [
-        [InlineKeyboardButton("Open Site", url=link)],
-        [
-            InlineKeyboardButton("My Sites", callback_data="mysites"),
-            InlineKeyboardButton("Delete", callback_data=f"delete_confirm_{site}"),
-        ],
+async def post_init(app):
+    me = await app.bot.get_me()
+    console_mod.BOT_STATE.update(running=True, username=me.username or "", error="")
+    user_cmds = [
+        BotCommand("start", "Main menu"), BotCommand("mysites", "Your sites"), BotCommand("info", "Site details"),
+        BotCommand("qr", "QR code for a site"), BotCommand("rename", "Rename a site"),
+        BotCommand("delete", "Delete a site"), BotCommand("expire", "Auto-delete a site later"),
+        BotCommand("stats", "Statistics"), BotCommand("help", "Help"),
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    admin_cmds = user_cmds + [
+        BotCommand("panel", "Open web console"), BotCommand("status", "Server health"),
+        BotCommand("services", "Manage apps & bots"), BotCommand("logs", "Service logs"),
+        BotCommand("deploy", "Redeploy a service"), BotCommand("restart", "Restart a service"),
+        BotCommand("svcstart", "Start a service"), BotCommand("svcstop", "Stop a service"),
+        BotCommand("setenv", "Set a service variable"), BotCommand("broadcast", "Message all users"),
+    ]
+    await app.bot.set_my_commands(user_cmds)
+    if C.ADMIN_ID:
+        try:
+            await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(C.ADMIN_ID))
+        except Exception:
+            pass
+    logger.info("Bot @%s ready", me.username)
 
-    await update.message.reply_text(
-        f"**Site Deployed!**\n\n"
-        f"Name: `{site}`\n"
-        f"Link: {link}\n"
-        f"Files: {file_count}\n"
-        f"HTML Pages: {', '.join(html_files) if html_files else 'None found'}\n\n"
-        f"Your site is now live!",
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
 
-    del user_state[user_id]
-
-
-# --------------- RUN BOT ---------------
 def run_bot():
-    if not TOKEN:
-        logger.error("BOT_TOKEN not set! Set the BOT_TOKEN environment variable.")
-        return
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("mysites", cmd_mysites))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("rename", cmd_rename))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("allusers", cmd_allusers))
-    app.add_handler(CommandHandler("allsites", cmd_allsites))
-
-    # Callback queries (inline buttons)
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    # File and text handlers
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("Bot started!")
-    app.run_polling(drop_pending_updates=True)
+    app = ApplicationBuilder().token(C.TOKEN).post_init(post_init).build()
+    H = app.add_handler
+    for cmd, fn in [
+        ("start", cmd_start), ("help", cmd_help), ("mysites", cmd_mysites), ("info", cmd_info), ("qr", cmd_qr),
+        ("delete", cmd_delete), ("rename", cmd_rename), ("expire", cmd_expire), ("stats", cmd_stats),
+        ("panel", cmd_panel), ("status", cmd_status), ("services", cmd_services), ("logs", cmd_logs),
+        ("deploy", _svc_cmd("deploy")), ("restart", _svc_cmd("restart")), ("svcstart", _svc_cmd("start")),
+        ("svcstop", _svc_cmd("stop")), ("env", cmd_env), ("setenv", cmd_setenv), ("unsetenv", cmd_unsetenv),
+        ("broadcast", cmd_broadcast), ("allusers", cmd_allusers), ("allsites", cmd_allsites),
+        ("ban", _ban_cmd(True)), ("unban", _ban_cmd(False)),
+    ]:
+        H(CommandHandler(cmd, fn))
+    H(CallbackQueryHandler(button_handler))
+    H(MessageHandler(filters.Document.ALL, handle_file))
+    H(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
+    logger.info("Starting Telegram bot...")
+    app.run_polling(drop_pending_updates=True, stop_signals=None)
 
 
-# --------------- MAIN ---------------
+# =============================================================== MAIN
+def run_web():
+    try:
+        from waitress import serve as wserve
+        wserve(app_web, host="0.0.0.0", port=C.PORT, threads=24, max_request_body_size=max(C.MAX_UPLOAD_MB, 100) * 1024 * 1024)
+    except ImportError:
+        app_web.run(host="0.0.0.0", port=C.PORT, threaded=True, debug=False)
+
+
+def main():
+    C.start_background_workers()
+    S.start_monitor()
+    threading.Thread(target=run_web, daemon=True, name="web").start()
+    logger.info("Console: %s/  (port %s)", C.DOMAIN, C.PORT)
+    if C.GENERATED_PASSWORD:
+        logger.warning("ADMIN_PASSWORD / API_KEY not set. Generated login password: %s", C.ADMIN_PASSWORD)
+        logger.warning("Set ADMIN_PASSWORD in your environment settings to choose your own.")
+    if not C.ADMIN_ID:
+        logger.warning("ADMIN_ID not set: Telegram admin commands & notifications are disabled.")
+    if C.TOKEN:
+        # keep the web server alive even if the bot crashes/restarts
+        while True:
+            try:
+                run_bot()
+            except Exception as e:
+                logger.exception("Bot stopped")
+                console_mod.BOT_STATE.update(running=False, error=str(e)[:200])
+            time.sleep(10)
+    else:
+        logger.warning("BOT_TOKEN not set: running web console only.")
+        console_mod.BOT_STATE.update(running=False, error="BOT_TOKEN not set")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+    S.stop_all()
+
+
 if __name__ == "__main__":
-    os.makedirs(WEBSITES_DIR, exist_ok=True)
-    threading.Thread(target=run_web, daemon=True).start()
-    logger.info(f"Web server started on port 8000")
-    logger.info(f"Domain: {DOMAIN}")
-    run_bot()
+    main()
