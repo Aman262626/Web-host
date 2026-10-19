@@ -1,124 +1,67 @@
 # Web-Host
 
-Instant website hosting via **Telegram Bot** and **Web Dashboard**. Upload a ZIP file and get a live website link in seconds.
+Telegram bot + **web console** that hosts static sites and runs apps/bots (Python, Node, Docker) with live logs, env vars and auto-restart. Open your Render URL and sign in.
 
-## Features
+## What you get
 
-### Telegram Bot
-- **ZIP Upload** - Send a ZIP file to deploy a website instantly
-- **Site Management** - `/mysites`, `/delete`, `/rename` commands
-- **Admin Panel** - `/stats`, `/broadcast`, `/allusers`, `/allsites`
-- **Inline Buttons** - Interactive menu for easy navigation
-- **Analytics** - Visit tracking for each deployed site
-- **Rate Limiting** - Max 50MB per upload
-- **Multi-User** - Each user manages their own sites
+**Web console (`/`)**
+- **Overview** - CPU / RAM / disk, service status, 14-day traffic, activity feed, runtime checks (Docker / Git / Node)
+- **Sites** - upload a ZIP (drag & drop with progress), file browser + editor, rename, ZIP download, SPA mode, auto-delete timer
+- **Services** (Render-style)
+  - Create from **ZIP or GitHub repo**, **native or Docker** runtime, **web service or background worker** (Telegram bots)
+  - **Live logs** (follow, filter, wrap, copy, save), separate **deploy logs** with success/failure and the exact error
+  - **Environment variables** (masked, `.env` paste, shared vars, restart on save)
+  - **Files** (browse/edit/upload), **Shell** (one-off commands), **Settings** (build/start cmd, port, auto-restart)
+  - Auto-restart with back-off, crash alerts, deploy history, GitHub **auto-deploy webhook**
+  - Web services are reverse-proxied at `/svc/<name>/`
+- **Telegram** - bot status, users, ban/unban, broadcast
 
-### Web Dashboard (Vercel)
-- **Modern Dark/Light UI** - Responsive design with theme toggle
-- **Upload Interface** - Drag & drop ZIP upload with progress
-- **Site Management** - View, search, copy URL, delete sites
-- **Dashboard** - Stats overview with total sites, visits, users
-- **Settings** - Configure API URL and API key
+**Telegram bot**
+- Users: `/start /mysites /info /qr /rename /delete /expire /stats`; caption a ZIP with the site name to deploy instantly; QR codes; inline buttons
+- Admin: `/status /services /logs /deploy /restart /svcstart /svcstop /setenv /env /unsetenv /broadcast /ban /unban /panel`; deploy/crash alerts are sent to you
 
-### Bot Commands
+## Deploy a project straight from GitHub (no ZIP)
 
-| Command | Description |
-|---------|-------------|
-| `/start` | Main menu with inline buttons |
-| `/help` | Show all commands |
-| `/mysites` | List your deployed sites |
-| `/delete <name>` | Delete a site |
-| `/rename <old> <new>` | Rename a site |
-| `/stats` | View statistics |
-| `/broadcast <msg>` | Send message to all users (admin) |
-| `/allusers` | List all users (admin) |
-| `/allsites` | List all sites (admin) |
+1. Console -> **Services -> New service -> Git repository**
+2. Public repo: paste the URL. Private repo or the repo picker: set a `GITHUB_TOKEN` (fine-grained token with *Contents: read*) in the host environment or in **Environment -> Shared variables**, then click **Load** to choose from your repos.
+3. Optional: copy the **auto-deploy webhook** from the service's Settings into GitHub (*Settings -> Webhooks*, push events) to redeploy on every push.
 
-## Setup
+The token is sent to GitHub as a one-off header, is not written to `.git/config` and does not appear in logs.
 
-### 1. Bot Setup (Backend)
+## Deploy this project on Render
+
+1. New **Web Service** -> this repo -> **Root Directory** `bot`
+2. Environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `ADMIN_PASSWORD` | Console login password (**set this**). Falls back to `API_KEY` if unset |
+| `BOT_TOKEN` | Telegram bot token (optional) |
+| `ADMIN_ID` | Your Telegram user id (admin commands + alerts) |
+| `API_KEY` | Key for `/api/upload` |
+| `DOMAIN` | Optional; defaults to Render's external URL |
+| `DATA_DIR` | `/data` - mount a Render Disk there |
+| `GITHUB_TOKEN` | Optional; list/deploy private repos |
+
+If `ADMIN_PASSWORD` and `API_KEY` are both unset, a random password is printed in the deploy logs.
+
+## Important limits
+
+- **Persistence:** Render's free tier has no disk - sites, services and env vars are lost on every redeploy/restart. Attach a Disk (paid) and set `DATA_DIR=/data`. The console warns you when data is not persistent.
+- **Docker runtime:** Render/Railway/Vercel do **not** give containers a Docker daemon, so the *Docker* runtime cannot build images there. The console detects this, disables the Docker option, and runs Dockerfile projects **natively** (reads `CMD`, `ENV`, `EXPOSE`, and `pip`/`npm` RUN steps). For real Docker, run on a VPS with `docker compose up -d` (mounts the host Docker socket).
+- Services run as the same OS user as the console. Only host code you trust. Variables like `BOT_TOKEN` are **not** inherited by services.
+- Free instances sleep when idle, which also pauses your bots. Use a paid instance or an uptime pinger on `/health`.
+
+## Run locally
 
 ```bash
 cd bot
 pip install -r requirements.txt
+ADMIN_PASSWORD=secret python webhost.py     # http://localhost:8000
 ```
 
-Create a `.env` file:
-```env
-BOT_TOKEN=your_telegram_bot_token
-DOMAIN=https://your-domain.com
-ADMIN_ID=your_telegram_user_id
-API_KEY=your_secret_api_key
-```
+## Deploy from CI
 
-Run:
 ```bash
-python webhost.py
+curl -X POST https://YOUR-APP/api/upload -H "X-API-Key: $API_KEY" -F site_name=my-site -F file=@site.zip
 ```
-
-Get a public domain using Cloudflare Tunnel:
-```bash
-cloudflared tunnel --url http://localhost:8000
-```
-
-### 2. Web Dashboard (Vercel)
-
-Deploy the `frontend/` directory to Vercel:
-
-1. Go to [vercel.com](https://vercel.com)
-2. Import the repository
-3. Set **Root Directory** to `frontend`
-4. Deploy
-
-After deployment, open the dashboard and configure:
-- **API URL**: Your bot backend URL (from cloudflare tunnel or Render)
-- **API Key**: Same as `API_KEY` in your `.env`
-
-### 3. Deploy Bot on Render (Optional)
-
-1. Go to [render.com](https://render.com)
-2. Create a new **Web Service**
-3. Connect your GitHub repo
-4. Set **Root Directory** to `bot`
-5. Add environment variables (`BOT_TOKEN`, `DOMAIN`, `ADMIN_ID`, `API_KEY`)
-6. Deploy
-
-## API Endpoints
-
-| Method | Endpoint | Description | Auth |
-|--------|----------|-------------|------|
-| GET | `/` | Server status | No |
-| GET | `/api/sites` | List all sites | No |
-| GET | `/api/stats` | Server statistics | No |
-| POST | `/api/upload` | Upload a site (multipart form) | API Key |
-| DELETE | `/api/sites/<name>` | Delete a site | API Key |
-| GET | `/<site>/` | Visit a hosted site | No |
-
-## Project Structure
-
-```
-Web-host/
-├── README.md
-├── .gitignore
-├── bot/                     # Telegram Bot + Flask Server
-│   ├── webhost.py           # Main application
-│   ├── requirements.txt     # Python dependencies
-│   ├── Procfile             # Render deployment
-│   ├── Dockerfile           # Docker deployment
-│   ├── render.yaml          # Render config
-│   └── .env.example         # Environment template
-└── frontend/                # Web Dashboard (Vercel)
-    ├── index.html           # Dashboard UI
-    ├── vercel.json          # Vercel config
-    ├── css/
-    │   └── style.css        # Styles
-    └── js/
-        └── app.js           # Application logic
-```
-
-## Tech Stack
-
-- **Bot**: Python, python-telegram-bot, Flask, Flask-CORS
-- **Frontend**: HTML5, CSS3, JavaScript (vanilla)
-- **Hosting**: Vercel (frontend), Render/VPS (bot)
-- **Tunnel**: Cloudflare Tunnel (for local development)

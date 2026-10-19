@@ -1,15 +1,22 @@
 services:
   - type: web
-    name: web-host-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python webhost.py
+    name: web-host
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    rootDir: bot
+    healthCheckPath: /health
+    # Attach a persistent disk (paid plans) so sites, services and env vars survive redeploys:
+    # disk:
+    #   name: data
+    #   mountPath: /data
+    #   sizeGB: 5
     envVars:
-      - key: BOT_TOKEN
+      - key: ADMIN_PASSWORD
         sync: false
-      - key: DOMAIN
+      - key: BOT_TOKEN
         sync: false
       - key: ADMIN_ID
         sync: false
-      - key: API_KEY
-        sync: false
+      - key: DATA_DIR
+        value: /data
