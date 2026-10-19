@@ -94,7 +94,7 @@ function mountFiles(el, scope, name) {
 }
 
 /* ---------- services list ---------- */
-async function viewServices(v) {
+async function viewServices(v = $("#view")) {
   const draw = d => {
     v.innerHTML = head('Compute', 'Services', 'Web apps, APIs and always-on workers (Telegram bots) — run natively or in Docker, with live logs and auto-restart.', `<button class="btn pri" id="nv">${ic('plus')}New service</button>`) +
     (d.services.length ? `<div class="grid g3">${d.services.map((s, i) => `<a class="panel hover svc reveal" style="--i:${i};text-decoration:none;display:block" href="#/services/${encodeURIComponent(s.name)}">
