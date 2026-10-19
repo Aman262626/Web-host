@@ -1,32 +1,10 @@
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-*.egg
-.venv/
-venv/
-env/
-
-# Environment
+*.pyc
 .env
-*.env.local
-
-# Data
 bot/websites/
+bot/services/
+bot/tmp/
 bot/data.json
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Node (frontend)
-node_modules/
-.vercel/
+bot/services.json
+bot/events.json
+bot/.secrets.json
