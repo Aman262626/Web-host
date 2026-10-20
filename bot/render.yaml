@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: web-host
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    rootDir: bot
+    healthCheckPath: /health
+    # Attach a persistent disk (paid plans) so sites, services and env vars survive redeploys:
+    # disk:
+    #   name: data
+    #   mountPath: /data
+    #   sizeGB: 5
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DATA_DIR
+        value: /data

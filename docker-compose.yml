@@ -1,0 +1,14 @@
+# Full-power setup for a VPS: console + real Docker support for your services.
+services:
+  web-host:
+    build: ./bot
+    ports: ["8000:8000"]
+    env_file: ./bot/.env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - webhost-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock   # lets the Docker runtime build/run containers on the host
+    restart: unless-stopped
+volumes:
+  webhost-data:

@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web-Host - Instant Website Hosting</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <div class="header-content">
+                <div class="logo">
+                    <i class="fas fa-globe"></i>
+                    <span>Web-Host</span>
+                </div>
+                <nav class="nav">
+                    <a href="#dashboard" class="nav-link active" data-section="dashboard">Dashboard</a>
+                    <a href="#upload" class="nav-link" data-section="upload">Upload</a>
+                    <a href="#sites" class="nav-link" data-section="sites">Sites</a>
+                    <a href="#settings" class="nav-link" data-section="settings">Settings</a>
+                </nav>
+                <div class="header-actions">
+                    <button class="btn-icon" id="themeToggle" title="Toggle theme">
+                        <i class="fas fa-moon"></i>
+                    </button>
+                    <a href="https://t.me/" target="_blank" class="btn btn-primary btn-sm">
+                        <i class="fab fa-telegram"></i> Bot
+                    </a>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main">
+        <div class="container">
+            <!-- Dashboard Section -->
+            <section id="dashboard" class="section active">
+                <div class="section-header">
+                    <h1>Dashboard</h1>
+                    <p>Overview of your hosted websites</p>
+                </div>
+
+                <!-- Stats Cards -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon blue">
+                            <i class="fas fa-globe"></i>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="totalSites">0</span>
+                            <span class="stat-label">Total Sites</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon green">
+                            <i class="fas fa-eye"></i>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="totalVisits">0</span>
+                            <span class="stat-label">Total Visits</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon purple">
+                            <i class="fas fa-users"></i>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="totalUsers">0</span>
+                            <span class="stat-label">Users</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon orange">
+                            <i class="fas fa-server"></i>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="serverStatus">Online</span>
+                            <span class="stat-label">Server Status</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Sites -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2><i class="fas fa-clock"></i> Recent Sites</h2>
+                        <a href="#sites" class="btn btn-outline btn-sm" data-section="sites">View All</a>
+                    </div>
+                    <div class="card-body">
+                        <div id="recentSites" class="sites-list">
+                            <div class="empty-state">
+                                <i class="fas fa-inbox"></i>
+                                <p>No sites deployed yet</p>
+                                <a href="#upload" class="btn btn-primary btn-sm" data-section="upload">Upload your first site</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Upload Section -->
+            <section id="upload" class="section">
+                <div class="section-header">
+                    <h1>Upload Website</h1>
+                    <p>Deploy your website in seconds</p>
+                </div>
+
+                <div class="upload-container">
+                    <div class="card upload-card">
+                        <div class="card-body">
+                            <form id="uploadForm">
+                                <div class="form-group">
+                                    <label for="siteName">Site Name</label>
+                                    <div class="input-group">
+                                        <span class="input-prefix"><i class="fas fa-link"></i></span>
+                                        <input type="text" id="siteName" placeholder="my-awesome-site" required
+                                               pattern="[a-zA-Z0-9\-_]+" title="Letters, numbers, hyphens and underscores only">
+                                    </div>
+                                    <small class="form-hint">Your site will be available at: <span id="sitePreviewUrl">your-domain/site-name/</span></small>
+                                </div>
+
+                                <div class="form-group">
+                                    <label>Website ZIP File</label>
+                                    <div class="upload-zone" id="uploadZone">
+                                        <input type="file" id="fileInput" accept=".zip" hidden>
+                                        <div class="upload-icon">
+                                            <i class="fas fa-cloud-upload-alt"></i>
+                                        </div>
+                                        <h3>Drag & Drop your ZIP file here</h3>
+                                        <p>or click to browse</p>
+                                        <span class="upload-hint">Max file size: 50MB | Only .zip files</span>
+                                    </div>
+                                    <div id="fileInfo" class="file-info" style="display:none;">
+                                        <i class="fas fa-file-archive"></i>
+                                        <span id="fileName"></span>
+                                        <span id="fileSize"></span>
+                                        <button type="button" id="removeFile" class="btn-icon-sm">
+                                            <i class="fas fa-times"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="form-group">
+                                    <button type="submit" class="btn btn-primary btn-lg btn-block" id="deployBtn">
+                                        <i class="fas fa-rocket"></i> Deploy Website
+                                    </button>
+                                </div>
+                            </form>
+
+                            <!-- Upload Progress -->
+                            <div id="uploadProgress" class="upload-progress" style="display:none;">
+                                <div class="progress-bar">
+                                    <div class="progress-fill" id="progressFill"></div>
+                                </div>
+                                <span class="progress-text" id="progressText">Uploading...</span>
+                            </div>
+
+                            <!-- Upload Result -->
+                            <div id="uploadResult" class="upload-result" style="display:none;">
+                                <div class="result-icon success">
+                                    <i class="fas fa-check-circle"></i>
+                                </div>
+                                <h3>Site Deployed!</h3>
+                                <a id="resultLink" href="#" target="_blank" class="result-link"></a>
+                                <div class="result-actions">
+                                    <a id="visitSite" href="#" target="_blank" class="btn btn-primary">
+                                        <i class="fas fa-external-link-alt"></i> Visit Site
+                                    </a>
+                                    <button class="btn btn-outline" onclick="resetUpload()">
+                                        <i class="fas fa-plus"></i> Deploy Another
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Upload Instructions -->
+                    <div class="card instructions-card">
+                        <div class="card-header">
+                            <h2><i class="fas fa-info-circle"></i> How to Deploy</h2>
+                        </div>
+                        <div class="card-body">
+                            <div class="steps">
+                                <div class="step">
+                                    <div class="step-number">1</div>
+                                    <div class="step-content">
+                                        <h4>Prepare your website</h4>
+                                        <p>Make sure your site has an <code>index.html</code> file</p>
+                                    </div>
+                                </div>
+                                <div class="step">
+                                    <div class="step-number">2</div>
+                                    <div class="step-content">
+                                        <h4>Create a ZIP file</h4>
+                                        <p>Zip all your website files (HTML, CSS, JS, images)</p>
+                                    </div>
+                                </div>
+                                <div class="step">
+                                    <div class="step-number">3</div>
+                                    <div class="step-content">
+                                        <h4>Choose a name</h4>
+                                        <p>Pick a unique name for your site</p>
+                                    </div>
+                                </div>
+                                <div class="step">
+                                    <div class="step-number">4</div>
+                                    <div class="step-content">
+                                        <h4>Upload & Deploy</h4>
+                                        <p>Click deploy and your site goes live instantly!</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Sites Section -->
+            <section id="sites" class="section">
+                <div class="section-header">
+                    <div class="section-header-row">
+                        <div>
+                            <h1>All Sites</h1>
+                            <p>Manage your deployed websites</p>
+                        </div>
+                        <div class="section-actions">
+                            <div class="search-box">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="searchSites" placeholder="Search sites...">
+                            </div>
+                            <button class="btn btn-primary btn-sm" id="refreshSites">
+                                <i class="fas fa-sync-alt"></i> Refresh
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="sitesGrid" class="sites-grid">
+                    <div class="empty-state">
+                        <i class="fas fa-inbox"></i>
+                        <p>No sites deployed yet</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Settings Section -->
+            <section id="settings" class="section">
+                <div class="section-header">
+                    <h1>Settings</h1>
+                    <p>Configure your Web-Host instance</p>
+                </div>
+
+                <div class="settings-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2><i class="fas fa-server"></i> API Configuration</h2>
+                        </div>
+                        <div class="card-body">
+                            <div class="form-group">
+                                <label for="apiUrl">Backend API URL</label>
+                                <input type="url" id="apiUrl" placeholder="http://localhost:8000" class="form-input">
+                                <small class="form-hint">URL of your Web-Host backend server</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="apiKey">API Key</label>
+                                <div class="input-group">
+                                    <input type="password" id="apiKey" placeholder="Enter API key" class="form-input">
+                                    <button class="btn-icon" id="toggleApiKey" title="Show/Hide">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                </div>
+                                <small class="form-hint">Required for upload and delete operations</small>
+                            </div>
+                            <button class="btn btn-primary" id="saveSettings">
+                                <i class="fas fa-save"></i> Save Settings
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h2><i class="fab fa-telegram"></i> Telegram Bot</h2>
+                        </div>
+                        <div class="card-body">
+                            <p>You can also manage your sites via the Telegram bot.</p>
+                            <div class="bot-commands">
+                                <div class="command"><code>/start</code> - Main menu</div>
+                                <div class="command"><code>/mysites</code> - List your sites</div>
+                                <div class="command"><code>/delete &lt;name&gt;</code> - Delete a site</div>
+                                <div class="command"><code>/rename &lt;old&gt; &lt;new&gt;</code> - Rename</div>
+                                <div class="command"><code>/stats</code> - View statistics</div>
+                                <div class="command"><code>/help</code> - All commands</div>
+                            </div>
+                            <a href="https://t.me/" target="_blank" class="btn btn-outline btn-block">
+                                <i class="fab fa-telegram"></i> Open Telegram Bot
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>Web-Host &mdash; Instant Website Hosting via Telegram & Web</p>
+        </div>
+    </footer>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast"></div>
+
+    <!-- Delete Confirmation Modal -->
+    <div id="deleteModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-exclamation-triangle"></i> Delete Site</h3>
+                <button class="btn-icon" onclick="closeModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to delete <strong id="deleteSiteName"></strong>?</p>
+                <p class="text-muted">This action cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-danger" id="confirmDelete">
+                    <i class="fas fa-trash"></i> Delete
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
