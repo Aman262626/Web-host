@@ -19,8 +19,14 @@ from flask import Blueprint, request, jsonify, send_from_directory, send_file, R
 
 import common as C
 import supervisor as S
+import templates as T
+import api_extra
+import proxy
+from auth import require_admin
 
 bp = Blueprint("console", __name__)
+bp.register_blueprint(proxy.bp)
+bp.register_blueprint(api_extra.bp)
 UI_DIR = os.path.join(C.BASE_DIR, "ui")
 TMP_DIR = os.path.join(C.DATA_DIR, "tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -30,19 +36,6 @@ BOT_STATE = {"running": False, "username": "", "error": ""}
 
 # ------------------------------------------------------------------ auth
 _login_fail = {}
-
-
-def require_admin(f):
-    @wraps(f)
-    def wrapper(*a, **kw):
-        auth = request.headers.get("Authorization", "")
-        tok = auth[7:] if auth.startswith("Bearer ") else ""
-        if tok and C.verify_token(tok):
-            return f(*a, **kw)
-        if request.headers.get("X-API-Key") and request.headers.get("X-API-Key") == C.API_KEY:
-            return f(*a, **kw)
-        return jsonify({"error": "Unauthorized"}), 401
-    return wrapper
 
 
 @bp.post("/console/api/login")
@@ -109,7 +102,8 @@ def _site_row(name, info, analytics):
         "files": files, "size": size, "visits": a.get("visits", 0), "last_visit": a.get("last_visit"),
         "spark": [daily.get(d, 0) for d in days],
         "isolation": info.get("isolation", "sandbox"), "spa": bool(info.get("spa")),
-        "expires": info.get("expires"),
+        "expires": info.get("expires"), "domains": list(info.get("domains") or []),
+        "has_auth": bool(info.get("basic_auth")), "sub_host": f"{name}.{S.service_domain()}" if S.service_domain() else None,
     }
 
 
@@ -156,7 +150,8 @@ def overview():
         "sites": {"count": len(sites), "visits": total_visits, "spark": spark,
                   "size": sum(s["size"] for s in sites)},
         "services": [{"name": s["name"], "kind": s["kind"], "status": s["status"], "runtime": s["runtime"],
-                      "uptime": s["uptime"]} for s in services],
+                      "uptime": s["uptime"], "url": s.get("abs_url"), "health": (s.get("health") or {}).get("status"),
+                      "next_run": s.get("next_run")} for s in services],
         "users": len(data.get("users", {})),
         "bot": BOT_STATE,
         "events": C.get_events(25),
@@ -386,8 +381,15 @@ def services_list():
 def services_create():
     try:
         spec = _spec_from_request()
+        files = T.apply(spec)
         spec["name"] = C.slugify(spec.get("name", ""))
         name = S.create_service(spec)
+        if files:
+            T.write_files(files, S.src_dir(name))
+            hp = T.TEMPLATES[spec["template"]].get("health_path")
+            if hp:
+                S.update_cfg(name, health_path=hp)
+            return jsonify({"name": name, "deploy": S.deploy(name, "template")})
         zip_path = None
         if spec.get("source", "zip") == "zip" and request.files.get("file"):
             zip_path = _save_upload()
@@ -414,9 +416,36 @@ def service_patch(name):
     if not cfg:
         return jsonify({"error": "Not found"}), 404
     body = request.get_json(silent=True) or {}
-    allowed = {"build_cmd", "start_cmd", "branch", "auto_restart", "health_path", "runtime", "workdir", "notes",
-               "kind", "port", "repo"}
+    allowed = {"build_cmd", "start_cmd", "branch", "auto_restart", "health_path", "health_restart", "runtime",
+               "workdir", "notes", "kind", "port", "repo", "memory_mb", "schedule", "timeout_s"}
     upd = {k: v for k, v in body.items() if k in allowed}
+    if "kind" in upd:
+        if upd["kind"] not in S.KINDS:
+            return jsonify({"error": "Bad service type"}), 400
+        upd["auto_kind"] = upd["kind"] == "auto"
+        if upd["kind"] == "auto" and cfg.get("kind") in ("web", "worker"):
+            upd["kind"] = cfg["kind"]  # keep the detected type; it is re-detected on the next deploy
+    if "memory_mb" in upd or "timeout_s" in upd:
+        try:
+            if "memory_mb" in upd:
+                upd["memory_mb"] = max(0, int(upd["memory_mb"] or 0))
+            if "timeout_s" in upd:
+                upd["timeout_s"] = min(86400, max(10, int(upd["timeout_s"] or 1800)))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Memory limit and timeout must be numbers"}), 400
+    if "health_path" in upd:
+        hp = (upd["health_path"] or "").strip()
+        upd["health_path"] = ("/" + hp.lstrip("/")) if hp else ""
+    kind_after = upd.get("kind", cfg.get("kind"))
+    if "schedule" in upd or kind_after == "cron":
+        import cron
+        sched = (upd.get("schedule", cfg.get("schedule")) or "").strip()
+        if kind_after == "cron":
+            try:
+                cron.parse(sched)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+        upd["schedule"] = sched
     if "port" in upd:
         try:
             upd["port"] = int(upd["port"]) if upd["port"] not in (None, "") else None
@@ -425,7 +454,7 @@ def service_patch(name):
         for n, c in S.get_state()["services"].items():
             if n != name and upd["port"] in (c.get("port"), c.get("host_port")):
                 return jsonify({"error": f"Port {upd['port']} is used by '{n}'"}), 400
-    if upd.get("kind") == "web" and not (upd.get("port") or cfg.get("port")):
+    if upd.get("kind") in ("web", "worker", "auto") and not (upd.get("port") or cfg.get("port")):
         upd["port"] = S._free_port()
     if "runtime" in upd and upd["runtime"] not in ("native", "docker"):
         return jsonify({"error": "Bad runtime"}), 400
@@ -660,34 +689,3 @@ def settings():
         "data_dir": C.DATA_DIR, "persistent": C.DATA_DIR != C.BASE_DIR, "bot_token_set": bool(C.TOKEN),
         "admin_id": C.ADMIN_ID, "password_generated": C.GENERATED_PASSWORD,
     })
-
-
-# ------------------------------------------------------------------ reverse proxy for web services
-_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
-        "transfer-encoding", "upgrade", "content-encoding", "content-length", "host"}
-
-
-@bp.route("/svc/<name>/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-@bp.route("/svc/<name>/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-def svc_proxy(name, path):
-    cfg = S.get_cfg(name)
-    if not cfg or cfg.get("kind") != "web":
-        abort(404)
-    if not S.is_running(name):
-        return Response(f"<h1>{name} is {S.status_of(name)}</h1><p>This service is not running right now.</p>",
-                        status=503, mimetype="text/html")
-    runtime = cfg.get("runtime_used") or cfg["runtime"]
-    port = cfg.get("host_port") if runtime == "docker" else cfg.get("port")
-    url = f"http://127.0.0.1:{port}/{path}"
-    headers = {k: v for k, v in request.headers if k.lower() not in _HOP and k.lower() != "authorization"}
-    headers["X-Forwarded-Prefix"] = f"/svc/{name}"
-    headers["X-Forwarded-Proto"] = request.headers.get("X-Forwarded-Proto", request.scheme)
-    headers["X-Forwarded-Host"] = request.host
-    try:
-        up = requests.request(request.method, url, params=request.args, data=request.get_data(), headers=headers,
-                              cookies=request.cookies, allow_redirects=False, stream=True, timeout=60)
-    except requests.RequestException as e:
-        return Response(f"<h1>502 Bad gateway</h1><p>{name} did not answer: {e}</p>", status=502, mimetype="text/html")
-    out_headers = [(k, v) for k, v in up.headers.items() if k.lower() not in _HOP]
-    resp = Response(up.iter_content(chunk_size=16384), status=up.status_code, headers=out_headers)
-    return resp

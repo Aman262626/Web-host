@@ -223,7 +223,12 @@ def add_event(level, message, **extra):
             json.dump(events, f)
         os.replace(tmp, EVENTS_FILE)
     if level in ("error", "warn", "success") and extra.get("notify", True):
-        notify_admin(f"{ {'error': '🔴', 'warn': '🟠', 'success': '🟢'}[level] } {message}")
+        try:
+            import notify
+            notify.dispatch(level, message, extra)
+        except Exception:
+            logger.exception("notification dispatch failed")
+            notify_admin(message)
 
 
 def get_events(limit=100):
